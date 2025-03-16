@@ -11,12 +11,14 @@ import math
 
 GPT2_CONFIG = {
         "vocab_size": 50257,
-        "context_length": 1024,
-        "emb_dim": 768,
-        "n_heads": 12,
+        "context_length": 2048,
+        "emb_dim": 4096,
+        "n_heads_q": 32,
+        "n_heads_kv": None,
         "n_blocks": 12,
         "drop_rate": 0.1,
         "qkv_bias": False,
+        "batch_size": 32,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
         }
 
@@ -66,7 +68,7 @@ class RoPE(nn.Module):
         self.register_buffer('sin_terms', torch.repeat_interleave(sin_terms, 2, dim=-1))
 
     def forward(self, x):
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, n_heads, _ = x.shape
 
         cos = self.cos_terms[:seq_len]
         sin = self.sin_terms[:seq_len]
@@ -124,59 +126,83 @@ class SwiGLU(nn.Module):
         print(f"SwiGLU shape: {out.shape}")
         assert x.shape == out.shape, "input shape does not match SwiGLU shape"
         return out
+
+''' Repeat kv heads function (for GQA) '''
+
+def repeat_kv(x, n_rep):
+    b, seq_len, kv_heads, head_dim = x.shape
+
+    if n_rep == 1:
+        return x
+    return (
+            x[:, :, :, None, :]
+            .expand(b, seq_len, kv_heads, n_rep, head_dim)
+            .reshape(b, seq_len, kv_heads * n_rep, head_dim)
+    )
         
 ''' Masked Attention Head '''
 
-class Head(nn.Module):
-    def __init__(self, head_size, emb_dim=GPT2_CONFIG["emb_dim"], qkv_bias=GPT2_CONFIG["qkv_bias"], device=GPT2_CONFIG["device"]):
+class AttentionHeads(nn.Module):
+    def __init__(self, batch_size=GPT2_CONFIG["batch_size"], max_seq_len=GPT2_CONFIG["context_length"], emb_dim=GPT2_CONFIG["emb_dim"], n_heads_q=GPT2_CONFIG["n_heads_q"], n_heads_kv=GPT2_CONFIG["n_heads_kv"], qkv_bias=GPT2_CONFIG["qkv_bias"], device=GPT2_CONFIG["device"]):
         super().__init__()
-        
+
         self.emb_dim = emb_dim
-        self.head_size = head_size
+        self.n_heads_q = n_heads_q
+        self.n_heads_kv = n_heads_kv if n_heads_kv is not None else self.n_heads_q
+        self.head_dim_q = self.emb_dim // self.n_heads_q
+        self.head_dim_kv = self.emb_dim // self.n_heads_kv
 
-        self.rope = RoPE(emb_dim=head_size)
+        self.n_rep = self.n_heads_q // self.n_heads_kv
+        
+        self.wq = nn.Linear(emb_dim, emb_dim, bias=qkv_bias, device=device)
+        self.wk = nn.Linear(emb_dim, emb_dim, bias=qkv_bias, device=device)
+        self.wv = nn.Linear(emb_dim, emb_dim, bias=qkv_bias, device=device)
+        self.wo = nn.Linear(emb_dim, emb_dim, bias=False, device=device)
 
-        self.qw = nn.Linear(emb_dim, head_size, bias=qkv_bias, device=device)
-        self.kw = nn.Linear(emb_dim, head_size, bias=qkv_bias, device=device)
-        self.vw = nn.Linear(emb_dim, head_size, bias=qkv_bias, device=device)
+        # KV-Cache matrices
+        self.k_cache = torch.zeros((batch_size, max_seq_len, self.n_heads_kv, self.head_dim_kv))
+        self.v_cache = torch.zeros((batch_size, max_seq_len, self.n_heads_kv, self.head_dim_kv))
 
-    def forward(self, x, device=GPT2_CONFIG["device"]):
-        q = self.qw(x)
-        k = self.kw(x)
-        v = self.vw(x)
+        self.rope = RoPE()
 
-        rq = self.rope(q)
-        rk = self.rope(k)
+    def forward(self, x, start_pos):
+        b, t, c = x.shape
 
-        mask = torch.triu(torch.full((x.size(1), x.size(1)), float('-inf'), device=device), diagonal=1)
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
 
-        qk = rq @ rk.transpose(-2, -1)
-        scaling = qk * (self.emb_dim ** -0.5)
-        add_mask = scaling + mask
-        scaled_sm = F.softmax(add_mask, dim=-1)
-        qk_v = scaled_sm @ v
+        xq = xq.view(b, t, self.n_heads_q, self.head_dim_q)
+        xk = xk.view(b, t, self.n_heads_kv, self.head_dim_kv)
+        xv = xv.view(b, t, self.n_heads_kv, self.head_dim_kv)
 
-        print(f"head shape:\t{qk_v.shape}")
-        return qk_v
+        xq = self.rope(xq) 
+        xk = self.rope(xk) 
 
-''' Multi Head Masked Attention '''
+        # Caching the key and value 
 
-class Multi_Head(nn.Module):
-    def __init__(self, emb_dim=GPT2_CONFIG["emb_dim"], n_heads=GPT2_CONFIG["n_heads"], device=GPT2_CONFIG["device"]):
-        super().__init__()
+        self.k_cache = self.k_cache.to(xq)
+        self.v_cache = self.v_cache.to(xq)
 
-        self.head_size = emb_dim // n_heads
+        self.k_cache[:b, start_pos: start_pos + seq_len] = xk
+        self.v_cache[:b, start_pos: start_pos + seq_len] = xv
 
-        self.heads = nn.ModuleList([Head(self.head_size) for _ in range(n_heads)])
-        self.lyr = nn.Linear(emb_dim, emb_dim, bias=False, device=device)
+        keys = self.k_cache[:b, :start_pos + seq_len]
+        values = self.v_cache[:b, :start_pos + seq_len]
 
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
-        out = self.lyr(out)
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
 
-        assert x.shape == out.shape, "positional encoding input shape does not match multi-head output shape"
-        print(f"multi head shape:\t{out.shape}")
-        return out
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        scores = (xq @ keys.transpose(2, 3)) / math.sqrt(self.head_dim_q)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = scores @ values
+        output = output.transpose(1, 2).contiguous().view(b, t, -1)
+
+        return self.wo(output)
 
 ''' Feed Forward Layer '''
 
