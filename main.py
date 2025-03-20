@@ -11,18 +11,18 @@ import math
 
 GPT2_CONFIG = {
         "vocab_size": 50257,
-        "context_length": 2048,
-        "emb_dim": 4096,
-        "n_heads_q": 32,
+        "context_length": 1024, #2048,
+        "emb_dim": 512, #4096,
+        "n_heads_q": 8, #32,
         "n_heads_kv": None,
-        "n_blocks": 12,
+        "n_blocks": 8, #12,
         "drop_rate": 0.1,
         "qkv_bias": False,
         "batch_size": 32,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
         }
 
-GPT2_CONFIG["ff_hidden_size"] = 4 * GPT2_CONFIG["emb_dim"]
+GPT2_CONFIG["ff_hidden_size"] = int(8 * GPT2_CONFIG["emb_dim"] / 3)
 
 print(f"device:\t{GPT2_CONFIG['device']}")
 
@@ -46,7 +46,8 @@ class Embedding(nn.Module):
         print(f"embedded tokens shape:\t{out.shape}")
         return out
 
-''' RoPE (Rotary Positional Encoding) '''
+'''
+# RoPE (Rotary Positional Encoding) # 
 
 class RoPE(nn.Module):
     def __init__(self, max_seq_len=GPT2_CONFIG["context_length"], emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
@@ -82,6 +83,24 @@ class RoPE(nn.Module):
         print(f"RoPE shape: {out.shape}")
         assert x.shape == out.shape, "input embedding shape does not match RoPE shape"
         return out
+'''
+
+''' RoPE (Original Paper Method) '''
+
+def calculate_theta_pos_freqs(head_dim, seq_len=GPT_CONFIG["context_length"], device=GPT_CONFIG["device"], theta=10000.0):
+  theta_num = torch.arange(0, head_dim, 2, device=device).float()
+  theta = 1.0 / (theta ** (2 * theta_num / head_dim))
+  m = torch.arange(seq_len, device=device)
+  freqs = torch.outer(m, theta).float()
+  freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+  return freqs_complex
+
+def rope_embeddings(x, freqs_complex, device=GPT_CONFIG["device"]):
+  x_complex = torch.view_as_complex(x.float().reshape(*x[:-1], -1, 2))
+  freqs_complex = freqs_complex.unsqueeze(-1).unsqueeze(2)
+  out = torch.view_as_real(x_complex * freqs_complex)
+  out = out.reshape(*x)
+  return out.type_as(x).to(device)
 
 ''' RMSNorm (Root Mean Square Normalization) '''
 
@@ -92,7 +111,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.emb_dim = emb_dim
 
-        self.gamma = torch.ones([self.emb_dim], requires_grad=True, device=device)
+        self.gamma = nn.Parameter(torch.ones([self.emb_dim], requires_grad=True, device=device))
 
     def forward(self, x):
         rms = torch.sqrt(self.eps + torch.mean(x ** 2))
@@ -105,14 +124,14 @@ class RMSNorm(nn.Module):
 ''' SwiGLU Activation Function '''
 
 class SwiGLU(nn.Module):
-    def __init__(self, emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
+    def __init__(self, ff_hidden_size=GPT2_CONFIG["ff_hidden_size"], emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
         super().__init__()
 
-        h = int(8 * emb_dim / 3)
+        # h = int(8 * emb_dim / 3)
 
-        self.w = nn.Linear(4 * emb_dim, h, device=device)
-        self.v = nn.Linear(4 * emb_dim, h, device=device)
-        self.down_proj = nn.Linear(h, 4 * emb_dim, device=device)
+        self.w = nn.Linear(ff_hidden_size, ff_hidden_size, device=device)
+        self.v = nn.Linear(ff_hidden_size, ff_hidden_size, device=device)
+        self.down_proj = nn.Linear(ff_hidden_size, ff_hidden_size, device=device)
 
     def forward(self, x, device=GPT2_CONFIG["device"]):
         b, t, c = x.shape
@@ -163,9 +182,9 @@ class AttentionHeads(nn.Module):
         self.k_cache = torch.zeros((batch_size, max_seq_len, self.n_heads_kv, self.head_dim_kv))
         self.v_cache = torch.zeros((batch_size, max_seq_len, self.n_heads_kv, self.head_dim_kv))
 
-        self.rope = RoPE()
+        # self.rope = RoPE()
 
-    def forward(self, x, start_pos):
+    def forward(self, x, start_pos, freqs_complex):
         b, t, c = x.shape
 
         xq = self.wq(x)
@@ -176,8 +195,8 @@ class AttentionHeads(nn.Module):
         xk = xk.view(b, t, self.n_heads_kv, self.head_dim_kv)
         xv = xv.view(b, t, self.n_heads_kv, self.head_dim_kv)
 
-        xq = self.rope(xq) 
-        xk = self.rope(xk) 
+        xq = rope_embeddings(xq, freqs_complex) 
+        xk = rope_embeddings(xk, freqs_complex) 
 
         # Caching the key and value 
 
@@ -229,14 +248,15 @@ class Block(nn.Module):
     def __init__(self, emb_dim=GPT2_CONFIG["emb_dim"], drop_rate=GPT2_CONFIG["drop_rate"]):
         super().__init__()
 
-        self.m_head = Multi_Head()
+        # self.m_head = Multi_Head()
+        self.attn_heads = AttentionHeads()
         self.ff = FeedForward()
         self.rms1 = RMSNorm()
         self.rms2 = RMSNorm()
         self.dropout = nn.Dropout(drop_rate)
 
-    def forward(self, x):
-        out = x + self.m_head(self.rms1(x))
+    def forward(self, x, start_pos, freqs_complex):
+        out = x + self.attn_heads(self.rms1(x), start_pos, freqs_complex)
         out = out + self.ff(self.rms2(out))
 
         print(f"block shape:\t{out.shape}")
@@ -254,11 +274,18 @@ class GPT2(nn.Module):
         self.rmsnorm = RMSNorm()
         self.lyr = nn.Linear(emb_dim, vocab_size, device=device)
 
-    def forward(self, x):
+        self.freqs_complex = calculate_theta_pos_freqs(emb_dim // n_heads)
+
+    def forward(self, x, start_pos):
+        b, t = x.shape
+        assert t == 1, "Only one token at a time can be processed"
+
         out = self.embd(x)
 
+        freqs_complex = self.freqs_complex[start_pos: start_pos + t]
+
         for block in self.block_list:
-            out = block(out)
+            out = block(out, start_pos, freqs_complex)
 
         out = self.lyr(self.rmsnorm(out))
 
@@ -266,8 +293,9 @@ class GPT2(nn.Module):
         return out
 
 gpt2 = GPT2()
-gpt2.to(GPT2_CONFIG["device"])
-x_gpt2 = gpt2(enc_inp)
 
 gpt2_params = sum(p.numel() for p in gpt2.parameters())
 print(f"GPT2 Params:\t{gpt2_params}")
+
+gpt2.to(GPT2_CONFIG["device"])
+# x_gpt2 = gpt2(enc_inp)
