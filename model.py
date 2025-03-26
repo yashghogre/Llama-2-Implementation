@@ -3,13 +3,12 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GPT2Tokenizer
 from datasets import load_dataset
 import math
 
 ''' Config '''
 
-GPT2_CONFIG = {
+LLaMA_2_CONFIG = {
         "vocab_size": 50257,
         "context_length": 1024, #2048,
         "emb_dim": 512, #4096,
@@ -19,24 +18,26 @@ GPT2_CONFIG = {
         "drop_rate": 0.1,
         "qkv_bias": False,
         "batch_size": 32,
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "temperature": 0.8
         }
 
-GPT2_CONFIG["ff_hidden_size"] = int(8 * GPT2_CONFIG["emb_dim"] / 3)
+LLaMA_2_CONFIG["ff_hidden_size"] = int(8 * LLaMA_2_CONFIG["emb_dim"] / 3)
 
-print(f"device:\t{GPT2_CONFIG['device']}")
+print(f"device:\t{LLaMA_2_CONFIG['device']}")
 
 ''' tokenizer '''
-
+'''
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 text = "My name is Yash"
-enc_inp = tokenizer.encode(text, return_tensors='pt').to(GPT2_CONFIG["device"])
+enc_inp = tokenizer.encode(text, return_tensors='pt').to(LLaMA_2_CONFIG["device"])
 print(f"input tokens shape:\t{enc_inp.shape}")
+'''
 
 ''' Embedding '''
 
 class Embedding(nn.Module):
-    def __init__(self, vocab_size=GPT2_CONFIG["vocab_size"], emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
+    def __init__(self, vocab_size=LLaMA_2_CONFIG["vocab_size"], emb_dim=LLaMA_2_CONFIG["emb_dim"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim, device=device)
 
@@ -50,7 +51,7 @@ class Embedding(nn.Module):
 # RoPE (Rotary Positional Encoding) # 
 
 class RoPE(nn.Module):
-    def __init__(self, max_seq_len=GPT2_CONFIG["context_length"], emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
+    def __init__(self, max_seq_len=LLaMA_2_CONFIG["context_length"], emb_dim=LLaMA_2_CONFIG["emb_dim"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         self.max_seq_len = max_seq_len 
@@ -87,7 +88,7 @@ class RoPE(nn.Module):
 
 ''' RoPE (Original Paper Method) '''
 
-def calculate_theta_pos_freqs(head_dim, seq_len=GPT_CONFIG["context_length"], device=GPT_CONFIG["device"], theta=10000.0):
+def calculate_theta_pos_freqs(head_dim, seq_len=LLaMA_2_CONFIG["context_length"], device=LLaMA_2_CONFIG["device"], theta=10000.0):
   theta_num = torch.arange(0, head_dim, 2, device=device).float()
   theta = 1.0 / (theta ** (2 * theta_num / head_dim))
   m = torch.arange(seq_len, device=device)
@@ -95,7 +96,7 @@ def calculate_theta_pos_freqs(head_dim, seq_len=GPT_CONFIG["context_length"], de
   freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
   return freqs_complex
 
-def rope_embeddings(x, freqs_complex, device=GPT_CONFIG["device"]):
+def rope_embeddings(x, freqs_complex, device=LLaMA_2_CONFIG["device"]):
   x_complex = torch.view_as_complex(x.float().reshape(*x[:-1], -1, 2))
   freqs_complex = freqs_complex.unsqueeze(-1).unsqueeze(2)
   out = torch.view_as_real(x_complex * freqs_complex)
@@ -105,7 +106,7 @@ def rope_embeddings(x, freqs_complex, device=GPT_CONFIG["device"]):
 ''' RMSNorm (Root Mean Square Normalization) '''
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps=1e-6, emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
+    def __init__(self, eps=1e-6, emb_dim=LLaMA_2_CONFIG["emb_dim"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         self.eps = eps
@@ -124,7 +125,7 @@ class RMSNorm(nn.Module):
 ''' SwiGLU Activation Function '''
 
 class SwiGLU(nn.Module):
-    def __init__(self, ff_hidden_size=GPT2_CONFIG["ff_hidden_size"], emb_dim=GPT2_CONFIG["emb_dim"], device=GPT2_CONFIG["device"]):
+    def __init__(self, ff_hidden_size=LLaMA_2_CONFIG["ff_hidden_size"], emb_dim=LLaMA_2_CONFIG["emb_dim"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         # h = int(8 * emb_dim / 3)
@@ -133,7 +134,7 @@ class SwiGLU(nn.Module):
         self.v = nn.Linear(ff_hidden_size, ff_hidden_size, device=device)
         self.down_proj = nn.Linear(ff_hidden_size, ff_hidden_size, device=device)
 
-    def forward(self, x, device=GPT2_CONFIG["device"]):
+    def forward(self, x, device=LLaMA_2_CONFIG["device"]):
         b, t, c = x.shape
 
         wx = self.w(x)
@@ -162,7 +163,7 @@ def repeat_kv(x, n_rep):
 ''' Masked Attention Head '''
 
 class AttentionHeads(nn.Module):
-    def __init__(self, batch_size=GPT2_CONFIG["batch_size"], max_seq_len=GPT2_CONFIG["context_length"], emb_dim=GPT2_CONFIG["emb_dim"], n_heads_q=GPT2_CONFIG["n_heads_q"], n_heads_kv=GPT2_CONFIG["n_heads_kv"], qkv_bias=GPT2_CONFIG["qkv_bias"], device=GPT2_CONFIG["device"]):
+    def __init__(self, batch_size=LLaMA_2_CONFIG["batch_size"], max_seq_len=LLaMA_2_CONFIG["context_length"], emb_dim=LLaMA_2_CONFIG["emb_dim"], n_heads_q=LLaMA_2_CONFIG["n_heads_q"], n_heads_kv=LLaMA_2_CONFIG["n_heads_kv"], qkv_bias=LLaMA_2_CONFIG["qkv_bias"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         self.emb_dim = emb_dim
@@ -226,7 +227,7 @@ class AttentionHeads(nn.Module):
 ''' Feed Forward Layer '''
 
 class FeedForward(nn.Module):
-    def __init__(self, emb_dim=GPT2_CONFIG["emb_dim"], ff_hidden_size=GPT2_CONFIG["ff_hidden_size"], device=GPT2_CONFIG["device"]):
+    def __init__(self, emb_dim=LLaMA_2_CONFIG["emb_dim"], ff_hidden_size=LLaMA_2_CONFIG["ff_hidden_size"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         self.lyr_1 = nn.Linear(emb_dim, ff_hidden_size, device=device)
@@ -245,7 +246,7 @@ class FeedForward(nn.Module):
 ''' Transformer Block '''
 
 class Block(nn.Module):
-    def __init__(self, emb_dim=GPT2_CONFIG["emb_dim"], drop_rate=GPT2_CONFIG["drop_rate"]):
+    def __init__(self, emb_dim=LLaMA_2_CONFIG["emb_dim"], drop_rate=LLaMA_2_CONFIG["drop_rate"]):
         super().__init__()
 
         # self.m_head = Multi_Head()
@@ -262,10 +263,10 @@ class Block(nn.Module):
         print(f"block shape:\t{out.shape}")
         return out
 
-''' GPT2 Model Class '''
+''' Transformer Model Class '''
 
-class GPT2(nn.Module):
-    def __init__(self, n_blocks=GPT2_CONFIG["n_blocks"], emb_dim=GPT2_CONFIG["emb_dim"], vocab_size=GPT2_CONFIG["vocab_size"], device=GPT2_CONFIG["device"]):
+class Transformer(nn.Module):
+    def __init__(self, n_blocks=LLaMA_2_CONFIG["n_blocks"], emb_dim=LLaMA_2_CONFIG["emb_dim"], vocab_size=LLaMA_2_CONFIG["vocab_size"], device=LLaMA_2_CONFIG["device"]):
         super().__init__()
 
         self.embd = Embedding()
@@ -292,10 +293,3 @@ class GPT2(nn.Module):
         print(f"GPT2 shape:\t{out.shape}")
         return out
 
-gpt2 = GPT2()
-
-gpt2_params = sum(p.numel() for p in gpt2.parameters())
-print(f"GPT2 Params:\t{gpt2_params}")
-
-gpt2.to(GPT2_CONFIG["device"])
-# x_gpt2 = gpt2(enc_inp)
